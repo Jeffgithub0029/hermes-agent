@@ -5001,6 +5001,59 @@ class AIAgent:
 
         return context
 
+    def _log_fallback_trigger(
+        self,
+        *,
+        source_model: Optional[str] = None,
+        source_provider: Optional[str] = None,
+        reason: "FailoverReason | None" = None,
+        trigger_error: Optional[Exception] = None,
+        error_context: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Log the upstream error that caused a fallback decision."""
+        if reason is None and trigger_error is None and not error_context:
+            return
+
+        status_code = getattr(trigger_error, "status_code", None)
+        if status_code is None:
+            response = getattr(trigger_error, "response", None)
+            status_code = getattr(response, "status_code", None)
+
+        upstream_code = None
+        upstream_message = None
+        if isinstance(error_context, dict):
+            _reason = error_context.get("reason")
+            if _reason not in (None, ""):
+                upstream_code = str(_reason).strip()
+            _message = error_context.get("message")
+            if isinstance(_message, str) and _message.strip():
+                upstream_message = _message.strip()
+
+        if not upstream_message and trigger_error is not None:
+            upstream_message = self._summarize_api_error(trigger_error)
+        if upstream_message:
+            upstream_message = self._clean_error_message(upstream_message)
+
+        details = []
+        reason_value = getattr(reason, "value", reason)
+        if reason_value:
+            details.append(f"reason={reason_value}")
+        if status_code is not None:
+            details.append(f"status={status_code}")
+        if upstream_code:
+            details.append(f"upstream_code={upstream_code}")
+        if upstream_message:
+            details.append(f'message="{upstream_message}"')
+        if not details:
+            return
+
+        logging.warning(
+            "Fallback trigger for %s (%s): %s",
+            source_model or getattr(self, "model", None),
+            source_provider or getattr(self, "provider", None),
+            ", ".join(details),
+        )
+
     def _usage_summary_for_api_request_hook(self, response: Any) -> Optional[Dict[str, Any]]:
         """Token buckets for ``post_api_request`` plugins (no raw ``response`` object)."""
         if response is None:
@@ -8605,7 +8658,12 @@ class AIAgent:
 
     # ── Provider fallback ──────────────────────────────────────────────────
 
-    def _try_activate_fallback(self, reason: "FailoverReason | None" = None) -> bool:
+    def _try_activate_fallback(
+        self,
+        reason: "FailoverReason | None" = None,
+        trigger_error: Optional[Exception] = None,
+        error_context: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         """Switch to the next fallback model/provider in the chain.
 
         Called when the current model is failing after retries.  Swaps the
@@ -8634,7 +8692,11 @@ class AIAgent:
         fb_provider = (fb.get("provider") or "").strip().lower()
         fb_model = (fb.get("model") or "").strip()
         if not fb_provider or not fb_model:
-            return self._try_activate_fallback()  # skip invalid, try next
+            return self._try_activate_fallback(
+                reason=reason,
+                trigger_error=trigger_error,
+                error_context=error_context,
+            )  # skip invalid, try next
 
         # Skip entries that resolve to the current (provider, model) — falling
         # back to the same backend that just failed loops the failure. Compare
@@ -8691,7 +8753,11 @@ class AIAgent:
                 logging.warning(
                     "Fallback to %s failed: provider not configured",
                     fb_provider)
-                return self._try_activate_fallback()  # try next in chain
+                return self._try_activate_fallback(
+                    reason=reason,
+                    trigger_error=trigger_error,
+                    error_context=error_context,
+                )  # try next in chain
             try:
                 from hermes_cli.model_normalize import normalize_model_for_provider
 
@@ -8728,6 +8794,7 @@ class AIAgent:
                 fb_api_mode = "bedrock_converse"
 
             old_model = self.model
+            old_provider = self.provider
 
             # Clear the per-config context_length override so the fallback
             # model's actual context window is resolved instead of inheriting
@@ -8821,6 +8888,13 @@ class AIAgent:
                     provider=self.provider,
                 )
 
+            self._log_fallback_trigger(
+                source_model=old_model,
+                source_provider=old_provider,
+                reason=reason,
+                trigger_error=trigger_error,
+                error_context=error_context,
+            )
             self._emit_status(
                 f"🔄 Primary model failed — switching to fallback: "
                 f"{fb_model} via {fb_provider}"
@@ -8832,7 +8906,11 @@ class AIAgent:
             return True
         except Exception as e:
             logging.error("Failed to activate fallback %s: %s", fb_model, e)
-            return self._try_activate_fallback()  # try next in chain
+            return self._try_activate_fallback(
+                reason=reason,
+                trigger_error=trigger_error,
+                error_context=error_context,
+            )  # try next in chain
 
     # ── Per-turn primary restoration ─────────────────────────────────────
 
@@ -13824,7 +13902,11 @@ class AIAgent:
                         )
                         if not pool_may_recover:
                             self._emit_status("⚠️ Rate limited — switching to fallback provider...")
-                            if self._try_activate_fallback(reason=classified.reason):
+                            if self._try_activate_fallback(
+                                reason=classified.reason,
+                                trigger_error=api_error,
+                                error_context=error_context,
+                            ):
                                 retry_count = 0
                                 compression_attempts = 0
                                 primary_recovery_attempted = False
@@ -14152,7 +14234,11 @@ class AIAgent:
                         # Try fallback before aborting — a different provider
                         # may not have the same issue (rate limit, auth, etc.)
                         self._emit_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                        if self._try_activate_fallback():
+                        if self._try_activate_fallback(
+                            reason=classified.reason,
+                            trigger_error=api_error,
+                            error_context=error_context,
+                        ):
                             retry_count = 0
                             compression_attempts = 0
                             primary_recovery_attempted = False
@@ -14219,7 +14305,11 @@ class AIAgent:
                             continue
                         # Try fallback before giving up entirely
                         self._emit_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
-                        if self._try_activate_fallback():
+                        if self._try_activate_fallback(
+                            reason=classified.reason,
+                            trigger_error=api_error,
+                            error_context=error_context,
+                        ):
                             retry_count = 0
                             compression_attempts = 0
                             primary_recovery_attempted = False

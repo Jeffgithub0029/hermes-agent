@@ -4292,6 +4292,48 @@ class TestFallbackAnthropicProvider:
         assert agent.api_mode == "chat_completions"
         assert agent.client is mock_client
 
+    def test_fallback_logs_trigger_details(self, agent, caplog):
+        agent._fallback_activated = False
+        agent._fallback_model = {"provider": "openrouter", "model": "anthropic/claude-sonnet-4"}
+        agent._fallback_chain = [agent._fallback_model]
+        agent._fallback_index = 0
+
+        mock_client = MagicMock()
+        mock_client.base_url = "https://openrouter.ai/api/v1"
+        mock_client.api_key = "sk-or-test"
+
+        error = SimpleNamespace(
+            status_code=503,
+            body={
+                "error": {
+                    "code": "service_unavailable",
+                    "message": "all channels exhausted right now",
+                }
+            },
+            response=SimpleNamespace(status_code=503, headers={}),
+        )
+        error_context = agent._extract_api_error_context(error)
+
+        with (
+            patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)),
+            caplog.at_level(logging.WARNING),
+        ):
+            result = agent._try_activate_fallback(
+                reason=FailoverReason.overloaded,
+                trigger_error=error,
+                error_context=error_context,
+            )
+
+        assert result is True
+        assert any(
+            "Fallback trigger for" in rec.message
+            and "reason=overloaded" in rec.message
+            and "status=503" in rec.message
+            and "upstream_code=service_unavailable" in rec.message
+            and "all channels exhausted right now" in rec.message
+            for rec in caplog.records
+        )
+
 
 def test_aiagent_uses_copilot_acp_client():
     with (
