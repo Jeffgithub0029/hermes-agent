@@ -11,6 +11,10 @@ web:
   backend: "firecrawl"       # Shared fallback — applies to both if specific keys not set
   search_backend: ""         # Per-capability override for web_search
   extract_backend: ""        # Per-capability override for web_extract
+  search_fallbacks: []        # Optional ordered fallback chain for web_search
+  search_cache:
+    enabled: true             # Persist successful web_search results
+    ttl_seconds: 21600        # Default cache TTL: 6 hours
 ```
 
 **Selection priority (per capability):**
@@ -19,6 +23,10 @@ web:
 3. Auto-detect from environment variables
 
 When per-capability keys are empty (default), behavior is identical to the legacy single-backend selection.
+
+`web_search` also supports an optional persistent cache and search-only fallback chain. By default, successful search results are cached under the Hermes home directory for 6 hours. Set `web.search_cache.enabled: false` to disable it. `web.search_fallbacks` accepts an ordered list such as `["bing", "serpapi"]`; when unset, Tavily search can automatically fall back to available Bing, SerpAPI, Brave, or DDGS providers, while legacy Firecrawl/Parallel/Exa behavior stays unchanged.
+
+Bing and SerpAPI require `BING_SEARCH_API_KEY` and `SERPAPI_API_KEY` respectively. They are search-only providers and cannot be used for `web_extract`.
 
 ## Architecture
 

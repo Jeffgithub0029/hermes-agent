@@ -45,8 +45,12 @@ import logging
 import os
 import re
 import asyncio
+import hashlib
+import time
+from pathlib import Path
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
 import httpx
+from hermes_constants import get_hermes_home
 # NOTE: `from firecrawl import Firecrawl` is deliberately NOT at module top —
 # the SDK pulls ~200 ms of imports (httpcore, firecrawl.v1/v2 type trees) and
 # we only need it when the backend is actually "firecrawl". We expose
@@ -134,7 +138,7 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs"}:
+    if configured in {"parallel", "firecrawl", "tavily", "exa", "bing", "serpapi", "searxng", "brave-free", "ddgs"}:
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
@@ -147,6 +151,8 @@ def _get_backend() -> str:
         ("parallel", _has_env("PARALLEL_API_KEY")),
         ("tavily", _has_env("TAVILY_API_KEY")),
         ("exa", _has_env("EXA_API_KEY")),
+        ("bing", _has_env("BING_SEARCH_API_KEY")),
+        ("serpapi", _has_env("SERPAPI_API_KEY")),
         ("searxng", _has_env("SEARXNG_URL")),
         ("brave-free", _has_env("BRAVE_SEARCH_API_KEY")),
         ("ddgs", _ddgs_package_importable()),
@@ -200,6 +206,10 @@ def _is_backend_available(backend: str) -> bool:
     """Return True when the selected backend is currently usable."""
     if backend == "exa":
         return _has_env("EXA_API_KEY")
+    if backend == "bing":
+        return _has_env("BING_SEARCH_API_KEY")
+    if backend == "serpapi":
+        return _has_env("SERPAPI_API_KEY")
     if backend == "parallel":
         return _has_env("PARALLEL_API_KEY")
     if backend == "firecrawl":
@@ -307,6 +317,8 @@ def _web_requires_env() -> list[str]:
         "EXA_API_KEY",
         "PARALLEL_API_KEY",
         "TAVILY_API_KEY",
+        "BING_SEARCH_API_KEY",
+        "SERPAPI_API_KEY",
         "FIRECRAWL_API_KEY",
         "FIRECRAWL_API_URL",
         "FIRECRAWL_GATEWAY_URL",
@@ -605,6 +617,132 @@ def _get_default_summarizer_model() -> Optional[str]:
     return model
 
 _debug = DebugSession("web_tools", env_var="WEB_TOOLS_DEBUG")
+
+
+# ─── Web Search Cache & Fallbacks ─────────────────────────────────────────────
+
+def _web_search_cache_enabled() -> bool:
+    cfg = _load_web_config().get("search_cache", {})
+    if isinstance(cfg, dict) and "enabled" in cfg:
+        return bool(cfg.get("enabled"))
+    return os.getenv("WEB_SEARCH_CACHE", "true").lower().strip() not in ("0", "false", "no", "off")
+
+
+def _web_search_cache_ttl_seconds() -> int:
+    cfg = _load_web_config().get("search_cache", {})
+    raw = cfg.get("ttl_seconds") if isinstance(cfg, dict) else None
+    if raw is None:
+        raw = os.getenv("WEB_SEARCH_CACHE_TTL_SECONDS", "21600")
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 21600
+
+
+def _web_search_cache_dir() -> Path:
+    configured = os.getenv("WEB_SEARCH_CACHE_DIR", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return get_hermes_home() / "cache" / "web_search"
+
+
+def _web_search_cache_key(backend: str, query: str, limit: int) -> str:
+    payload = json.dumps(
+        {"backend": backend, "query": query, "limit": int(limit)},
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _read_web_search_cache(backend: str, query: str, limit: int) -> Optional[dict]:
+    if not _web_search_cache_enabled():
+        return None
+    cache_file = _web_search_cache_dir() / f"{_web_search_cache_key(backend, query, limit)}.json"
+    try:
+        if not cache_file.exists():
+            return None
+        envelope = json.loads(cache_file.read_text(encoding="utf-8"))
+        ttl = _web_search_cache_ttl_seconds()
+        if ttl and time.time() - float(envelope.get("created_at", 0)) > ttl:
+            return None
+        data = envelope.get("data")
+        if isinstance(data, dict):
+            data.setdefault("cached", True)
+            return data
+    except Exception as exc:  # noqa: BLE001 — cache must never break search
+        logger.debug("web_search cache read failed: %s", exc)
+    return None
+
+
+def _write_web_search_cache(backend: str, query: str, limit: int, data: dict) -> None:
+    if not _web_search_cache_enabled() or not data.get("success"):
+        return
+    try:
+        cache_dir = _web_search_cache_dir()
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_file = cache_dir / f"{_web_search_cache_key(backend, query, limit)}.json"
+        envelope = {"created_at": time.time(), "backend": backend, "query": query, "limit": limit, "data": data}
+        cache_file.write_text(json.dumps(envelope, ensure_ascii=False), encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001 — cache must never break search
+        logger.debug("web_search cache write failed: %s", exc)
+
+
+def _configured_search_fallbacks(primary_backend: str) -> List[str]:
+    cfg = _load_web_config()
+    raw = cfg.get("search_fallbacks") or os.getenv("WEB_SEARCH_FALLBACKS", "")
+    if isinstance(raw, str):
+        candidates = [x.strip().lower() for x in raw.split(",") if x.strip()]
+    elif isinstance(raw, list):
+        candidates = [str(x).strip().lower() for x in raw if str(x).strip()]
+    else:
+        candidates = []
+
+    # Auto-fallbacks are intentionally opt-in for explicitly search-oriented
+    # backends. This preserves legacy Firecrawl/Parallel/Exa behavior while
+    # making Tavily degrade to Bing/SerpAPI when those keys are present.
+    defaults = ["bing", "serpapi", "brave-free", "ddgs"] if primary_backend == "tavily" else []
+    ordered: List[str] = []
+    for backend in candidates + defaults:
+        if backend != primary_backend and backend not in ordered and _is_backend_available(backend):
+            ordered.append(backend)
+    return ordered
+
+
+def _execute_search_backend(backend: str, query: str, limit: int) -> dict:
+    if backend == "parallel":
+        return _parallel_search(query, limit)
+    if backend == "exa":
+        return _exa_search(query, limit)
+    if backend == "searxng":
+        from tools.web_providers.searxng import SearXNGSearchProvider
+        return SearXNGSearchProvider().search(query, limit)
+    if backend == "brave-free":
+        from tools.web_providers.brave_free import BraveFreeSearchProvider
+        return BraveFreeSearchProvider().search(query, limit)
+    if backend == "ddgs":
+        from tools.web_providers.ddgs import DDGSSearchProvider
+        return DDGSSearchProvider().search(query, limit)
+    if backend == "bing":
+        from tools.web_providers.bing import BingSearchProvider
+        return BingSearchProvider().search(query, limit)
+    if backend == "serpapi":
+        from tools.web_providers.serpapi import SerpApiSearchProvider
+        return SerpApiSearchProvider().search(query, limit)
+    if backend == "tavily":
+        logger.info("Tavily search: '%s' (limit: %d)", query, limit)
+        raw = _tavily_request("search", {
+            "query": query,
+            "max_results": min(limit, 20),
+            "include_raw_content": False,
+            "include_images": False,
+        })
+        return _normalize_tavily_search_results(raw)
+
+    logger.info("Searching the web for: '%s' (limit: %d)", query, limit)
+    response = _get_firecrawl_client().search(query=query, limit=limit)
+    web_results = _extract_web_search_results(response)
+    return {"success": True, "data": {"web": web_results}}
 
 
 async def process_content_with_llm(
@@ -1177,35 +1315,8 @@ def web_search_tool(query: str, limit: int = 5) -> str:
     """
     Search the web for information using available search API backend.
 
-    This function provides a generic interface for web search that can work
-    with multiple backends (Parallel or Firecrawl).
-
-    Note: This function returns search result metadata only (URLs, titles, descriptions).
-    Use web_extract_tool to get full content from specific URLs.
-    
-    Args:
-        query (str): The search query to look up
-        limit (int): Maximum number of results to return (default: 5)
-    
-    Returns:
-        str: JSON string containing search results with the following structure:
-             {
-                 "success": bool,
-                 "data": {
-                     "web": [
-                         {
-                             "title": str,
-                             "url": str,
-                             "description": str,
-                             "position": int
-                         },
-                         ...
-                     ]
-                 }
-             }
-    
-    Raises:
-        Exception: If search fails or API key is not set
+    Adds a small persistent cache and search-only fallback chain so transient
+    Tavily/provider failures do not burn repeated API calls or break research.
     """
     try:
         limit = int(limit)
@@ -1214,120 +1325,78 @@ def web_search_tool(query: str, limit: int = 5) -> str:
     limit = min(max(limit, 1), 100)
 
     debug_call_data = {
-        "parameters": {
-            "query": query,
-            "limit": limit
-        },
+        "parameters": {"query": query, "limit": limit},
         "error": None,
         "results_count": 0,
         "original_response_size": 0,
-        "final_response_size": 0
+        "final_response_size": 0,
+        "backend": None,
+        "cache_hit": False,
+        "fallbacks_tried": [],
     }
-    
+
     try:
         from tools.interrupt import is_interrupted
         if is_interrupted():
             return tool_error("Interrupted", success=False)
 
-        # Dispatch to the configured search backend
-        backend = _get_search_backend()
-        if backend == "parallel":
-            response_data = _parallel_search(query, limit)
-            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
-            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
-            debug_call_data["final_response_size"] = len(result_json)
-            _debug.log_call("web_search_tool", debug_call_data)
-            _debug.save()
-            return result_json
+        primary_backend = _get_search_backend()
+        backends = [primary_backend] + _configured_search_fallbacks(primary_backend)
+        errors: List[str] = []
 
-        if backend == "exa":
-            response_data = _exa_search(query, limit)
-            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
-            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
-            debug_call_data["final_response_size"] = len(result_json)
-            _debug.log_call("web_search_tool", debug_call_data)
-            _debug.save()
-            return result_json
+        for backend in backends:
+            debug_call_data["backend"] = backend
+            cached = _read_web_search_cache(backend, query, limit)
+            if cached is not None:
+                response_data = cached
+                debug_call_data["cache_hit"] = True
+                debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+                result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+                debug_call_data["final_response_size"] = len(result_json)
+                _debug.log_call("web_search_tool", debug_call_data)
+                _debug.save()
+                return result_json
 
-        if backend == "searxng":
-            from tools.web_providers.searxng import SearXNGSearchProvider
-            response_data = SearXNGSearchProvider().search(query, limit)
-            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
-            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
-            debug_call_data["final_response_size"] = len(result_json)
-            _debug.log_call("web_search_tool", debug_call_data)
-            _debug.save()
-            return result_json
+            try:
+                response_data = _execute_search_backend(backend, query, limit)
+            except Exception as exc:  # noqa: BLE001 — fallback chain handles provider-specific failures
+                error = f"{backend}: {exc}"
+                logger.warning("web_search backend failed: %s", error)
+                errors.append(error)
+                debug_call_data["fallbacks_tried"].append({"backend": backend, "error": str(exc)})
+                continue
 
-        if backend == "brave-free":
-            from tools.web_providers.brave_free import BraveFreeSearchProvider
-            response_data = BraveFreeSearchProvider().search(query, limit)
-            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
-            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
-            debug_call_data["final_response_size"] = len(result_json)
-            _debug.log_call("web_search_tool", debug_call_data)
-            _debug.save()
-            return result_json
+            results_count = len(response_data.get("data", {}).get("web", []))
+            if response_data.get("success"):
+                if backend != primary_backend:
+                    response_data["fallback_from"] = primary_backend
+                    response_data["backend"] = backend
+                if results_count > 0:
+                    _write_web_search_cache(backend, query, limit, response_data)
+                debug_call_data["results_count"] = results_count
+                result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+                debug_call_data["final_response_size"] = len(result_json)
+                _debug.log_call("web_search_tool", debug_call_data)
+                _debug.save()
+                return result_json
 
-        if backend == "ddgs":
-            from tools.web_providers.ddgs import DDGSSearchProvider
-            response_data = DDGSSearchProvider().search(query, limit)
-            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
-            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
-            debug_call_data["final_response_size"] = len(result_json)
-            _debug.log_call("web_search_tool", debug_call_data)
-            _debug.save()
-            return result_json
+            error = response_data.get("error") or f"{backend}: no results"
+            errors.append(f"{backend}: {error}")
+            debug_call_data["fallbacks_tried"].append({"backend": backend, "error": str(error)})
 
-        if backend == "tavily":
-            logger.info("Tavily search: '%s' (limit: %d)", query, limit)
-            raw = _tavily_request("search", {
-                "query": query,
-                "max_results": min(limit, 20),
-                "include_raw_content": False,
-                "include_images": False,
-            })
-            response_data = _normalize_tavily_search_results(raw)
-            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
-            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
-            debug_call_data["final_response_size"] = len(result_json)
-            _debug.log_call("web_search_tool", debug_call_data)
-            _debug.save()
-            return result_json
-
-        logger.info("Searching the web for: '%s' (limit: %d)", query, limit)
-
-        response = _get_firecrawl_client().search(
-            query=query,
-            limit=limit
-        )
-
-        web_results = _extract_web_search_results(response)
-        results_count = len(web_results)
-        logger.info("Found %d search results", results_count)
-        
-        # Build response with just search metadata (URLs, titles, descriptions)
-        response_data = {
-            "success": True,
-            "data": {
-                "web": web_results
-            }
-        }
-        
-        # Capture debug information
-        debug_call_data["results_count"] = results_count
-        
-        # Convert to JSON
-        result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
-        
-        debug_call_data["final_response_size"] = len(result_json)
-        
-        # Log debug information
+        if len(backends) == 1:
+            original_error = errors[0]
+            prefix = f"{backends[0]}: "
+            if original_error.startswith(prefix):
+                original_error = original_error[len(prefix):]
+            error_msg = f"Error searching web: {original_error}"
+        else:
+            error_msg = "Error searching web: all configured backends failed (" + "; ".join(errors) + ")"
+        debug_call_data["error"] = error_msg
         _debug.log_call("web_search_tool", debug_call_data)
         _debug.save()
-        
-        return result_json
-        
+        return tool_error(error_msg)
+
     except Exception as e:
         error_msg = f"Error searching web: {str(e)}"
         logger.debug("%s", error_msg)
@@ -1429,9 +1498,15 @@ async def web_extract_tool(
                     "include_images": False,
                 })
                 results = _normalize_tavily_documents(raw, fallback_url=safe_urls[0] if safe_urls else "")
-            elif backend in {"searxng", "brave-free", "ddgs"}:
+            elif backend in {"bing", "serpapi", "searxng", "brave-free", "ddgs"}:
                 # These backends are search-only — they cannot extract URL content
-                _label = {"searxng": "SearXNG", "brave-free": "Brave Search (free tier)", "ddgs": "DuckDuckGo (ddgs)"}[backend]
+                _label = {
+                    "bing": "Bing Search",
+                    "serpapi": "SerpAPI",
+                    "searxng": "SearXNG",
+                    "brave-free": "Brave Search (free tier)",
+                    "ddgs": "DuckDuckGo (ddgs)",
+                }[backend]
                 return json.dumps({
                     "success": False,
                     "error": f"{_label} is a search-only backend and cannot extract URL content. "
@@ -2116,11 +2191,11 @@ def check_firecrawl_api_key() -> bool:
 def check_web_api_key() -> bool:
     """Check whether the configured web backend is available."""
     configured = _load_web_config().get("backend", "").lower().strip()
-    if configured in {"exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs"}:
+    if configured in {"exa", "parallel", "firecrawl", "tavily", "bing", "serpapi", "searxng", "brave-free", "ddgs"}:
         return _is_backend_available(configured)
     return any(
         _is_backend_available(backend)
-        for backend in ("exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs")
+        for backend in ("exa", "parallel", "firecrawl", "tavily", "bing", "serpapi", "searxng", "brave-free", "ddgs")
     )
 
 

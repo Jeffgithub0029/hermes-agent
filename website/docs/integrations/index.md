@@ -22,7 +22,7 @@ Hermes supports multiple AI inference providers out of the box. Use `hermes mode
 
 ## Web Search Backends
 
-The `web_search` and `web_extract` tools support four backend providers, configured via `config.yaml` or `hermes tools`:
+The `web_search` and `web_extract` tools support multiple backend providers, configured via `config.yaml` or `hermes tools`:
 
 | Backend | Env Var | Search | Extract | Crawl |
 |---------|---------|--------|---------|-------|
@@ -30,15 +30,22 @@ The `web_search` and `web_extract` tools support four backend providers, configu
 | **Parallel** | `PARALLEL_API_KEY` | ✔ | ✔ | — |
 | **Tavily** | `TAVILY_API_KEY` | ✔ | ✔ | ✔ |
 | **Exa** | `EXA_API_KEY` | ✔ | ✔ | — |
+| **Bing** | `BING_SEARCH_API_KEY` | ✔ | — | — |
+| **SerpAPI** | `SERPAPI_API_KEY` | ✔ | — | — |
 
 Quick setup example:
 
 ```yaml
 web:
-  backend: firecrawl    # firecrawl | parallel | tavily | exa
+  search_backend: tavily
+  extract_backend: firecrawl
+  search_fallbacks: ["bing", "serpapi"]
+  search_cache:
+    enabled: true
+    ttl_seconds: 21600
 ```
 
-If `web.backend` is not set, the backend is auto-detected from whichever API key is available. Self-hosted Firecrawl is also supported via `FIRECRAWL_API_URL`.
+If `web.backend` is not set, the backend is auto-detected from whichever API key is available. Self-hosted Firecrawl is also supported via `FIRECRAWL_API_URL`. `web_search` caches successful results by default for 6 hours and can fall back through `web.search_fallbacks`; Bing and SerpAPI are search-only and cannot power `web_extract`.
 
 ## Browser Automation
 

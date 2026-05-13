@@ -607,6 +607,11 @@ DEFAULT_CONFIG = {
         "backend": "",           # shared fallback — applies to both search and extract
         "search_backend": "",    # per-capability override for web_search (e.g. "searxng")
         "extract_backend": "",   # per-capability override for web_extract (e.g. "native")
+        "search_fallbacks": [],   # ordered web_search fallbacks, e.g. ["bing", "serpapi"]
+        "search_cache": {
+            "enabled": True,
+            "ttl_seconds": 21600,
+        },
     },
 
     "browser": {
