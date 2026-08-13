@@ -3277,6 +3277,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         role = "assistant"
         reasoning_parts: list = []
         usage_obj = None
+        # OpenCode Go terminates some successful streams with a final
+        # choices=[] chunk carrying only provider metadata (currently cost),
+        # without emitting the OpenAI-standard finish_reason or [DONE] event.
+        # Keep this scoped to that provider so a genuinely truncated stream
+        # from other OpenAI-compatible endpoints still enters the retry path.
+        opencode_go_cost_terminal = False
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
         _writer_token = {"value": None}
@@ -3451,6 +3457,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # Usage comes in the final chunk with empty choices
                 if hasattr(chunk, "usage") and chunk.usage:
                     usage_obj = chunk.usage
+                if agent.provider == "opencode-go":
+                    # The SDK may expose extra fields through ``model_extra``
+                    # instead of a direct attribute, depending on its version.
+                    extra = getattr(chunk, "model_extra", None)
+                    if (
+                        getattr(chunk, "cost", None) is not None
+                        or isinstance(extra, dict) and "cost" in extra
+                    ):
+                        opencode_go_cost_terminal = True
                 continue
 
             delta = chunk.choices[0].delta
@@ -3582,6 +3597,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 usage_obj = chunk.usage
 
         _close_managed_stream()
+
+        if opencode_go_cost_terminal and finish_reason is None:
+            finish_reason = "stop"
 
         if _stream_attempt_was_cancelled(stream_attempt_id):
             raise _httpx.RemoteProtocolError(
