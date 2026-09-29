@@ -94,6 +94,9 @@ jobs:
           # copy into a fresh fake-main commit on every invocation, moving the
           # update target mid-run.
           HERMES_E2E_LOG_DIR: ${{ runner.temp }}/e2e-logs
+          # Use local checked-out workspace as the sandbox upstream repo to avoid
+          # anonymous GitHub HTTPS fetch rate-limiting (429) across matrix legs.
+          HERMES_DEV_SANDBOX_UPSTREAM: ${{ github.workspace }}
 
       # Artifact names cannot contain '/', and install-ref may be a full ref
       # like refs/heads/main. GitHub Actions expressions have no string-replace
